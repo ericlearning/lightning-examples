@@ -1,0 +1,25 @@
+data: 
+    train_dir: 'data/train'
+    val_dir: 'data/val'
+
+
+training:
+    lr: 1e-4
+    bs: 4096
+    epoch_num: 10
+    
+    beta1: 0.9
+    beta2: 0.999
+    gradient_clip: 0
+    
+    n_workers: 10
+
+
+model:
+    ic: 784
+    hc: 256
+    oc: 10
+
+
+logging:
+    log_dir: 'log'

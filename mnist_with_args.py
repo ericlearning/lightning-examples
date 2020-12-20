@@ -1,152 +1,191 @@
+import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
+import pytorch_lightning as pl
+
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from tqdm import tqdm
-from argparse import ArgumentParser
-
-from pytorch_lightning import TrainResult, EvalResult
-from pytorch_lightning.trainer import Trainer
-from pytorch_lightning.core import LightningModule
+from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning import loggers as pl_loggers
-from pytorch_lightning import seed_everything
 
-# define architecture
-class ConvNet(nn.Module):
-    def __init__(self, ic, oc):
-        super(ConvNet, self).__init__()
-        self.m = nn.Sequential(
-            nn.Conv2d(ic, 16, 3, 1, 1),
-            nn.BatchNorm2d(16), nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, 3, 1, 1),
-            nn.BatchNorm2d(32), nn.ReLU(),
-            nn.MaxPool2d(2)
+from datetime import datetime
+from argparse import ArgumentParser
+from omegaconf import OmegaConf
+
+class SimpleNet(nn.Module):
+    def __init__(self, ic, hc, oc):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(ic, hc), nn.ReLU(),
+            nn.Linear(hc, hc), nn.ReLU(),
+            nn.Linear(hc, oc)
         )
-        self.cls = nn.Linear(7*7*32, 10)
     
     def forward(self, x):
-        bs = x.shape[0]
-        o = self.m(x).reshape(bs, -1)
-        o = self.cls(o)
-        return o
+        return self.net(x.reshape(-1, 28*28))
+        
 
-# define model
-class Model(LightningModule):
-    def __init__(self, ic, oc, lr, batch_size, data_pth, num_workers, **kwargs):
-        super(Model, self).__init__()
-        print(ic, oc, lr, batch_size, data_pth, num_workers)
-        self.save_hyperparameters()
-        self.ic = ic
-        self.oc = oc
-        self.lr = lr
-        self.batch_size = batch_size
-        self.data_pth = data_pth
-        self.num_workers = num_workers
-        self.model = ConvNet(self.ic, self.oc)
+class BoilerNet(pl.LightningModule):
+    def __init__(self, args):
+        super().__init__()
+        self.save_hyperparameters(args)
+
+        cfg = OmegaConf.load(args.config)
+        self.cfg = cfg
+        
+        self.model = SimpleNet(cfg.model.ic, cfg.model.hc, cfg.model.oc)
+        self.loss = nn.CrossEntropyLoss()
     
     def forward(self, x):
         return self.model(x)
     
     def training_step(self, batch, batch_idx):
-        x, t = batch
-        p = self(x)
-        loss = F.cross_entropy(p, t)
+        x, y = batch
+        pred = self(x)
+        loss = self.loss(pred, y)
+
+        output = {"loss": loss}
         
-        train_dict = {'train_loss': loss}
-        result = TrainResult(minimize=loss)
-        result.log_dict(train_dict)
-        return result
+        self.logger.experiment.add_scalar("Training Loss", loss.item(), self.global_step)
+        
+        return output
     
     def validation_step(self, batch, batch_idx):
-        x, t = batch
-        p = self(x)
-        loss = F.cross_entropy(p, t)
-        acc = (p.argmax(-1) == t).sum() / float(x.shape[0])
+        x, y = batch
+        pred = self(x)
+        loss = self.loss(pred, y)
         
-        val_dict = {'val_loss': loss, 'val_acc': acc}
-        result = EvalResult()
-        result.log_dict(val_dict)
-        return result
+        acc = (pred.argmax(1) == y).sum() / float(x.shape[0])
+
+        output = {
+            "batch_val_loss": loss,
+            "batch_val_acc": acc
+        }
+        
+        return output
     
     def validation_epoch_end(self, outputs):
-        acc_end = outputs.val_acc.mean()
-        result_end = EvalResult(checkpoint_on=acc_end)
-        return result_end
+        avg_loss = torch.stack([o["batch_val_loss"] for o in outputs]).mean()
+        avg_acc = torch.stack([o["batch_val_acc"] for o in outputs]).mean()
         
+        output = {
+            "val_loss": avg_loss,
+            "val_acc": avg_acc
+        }
+        
+        self.logger.experiment.add_scalar("Validation Loss", avg_loss.item(), self.global_step)
+        self.logger.experiment.add_scalar("Validation Acc", avg_acc.item(), self.global_step)
+        
+        return output
+    
     def configure_optimizers(self):
-        return optim.Adam(self.parameters(), lr=self.lr)
+        lr = self.cfg.training.lr
+        beta1 = self.cfg.training.beta1
+        beta2 = self.cfg.training.beta2
+        
+        opt = optim.Adam(self.model.parameters(), lr=lr, betas=(beta1, beta2))
+        return opt
     
     def train_dataloader(self):
+        num_gpus = self.hparams.num_gpus
+        num_nodes = self.hparams.num_nodes
+        dist_mode = self.hparams.dist_mode
+        grad_acc = self.hparams.grad_acc
+        bs, n_workers = self.cfg.training.bs, self.cfg.training.n_workers
+        bs = inv_effective_bs(bs, num_gpus, num_nodes, dist_mode, grad_acc)
+
         tf = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5])
         ])
-        train_ds = datasets.MNIST(root=self.data_pth, train=True, transform=tf, download=True)
-        train_dl = DataLoader(train_ds, self.batch_size, shuffle=True, num_workers=self.num_workers)
-        return train_dl
+        ds = datasets.MNIST(self.cfg.data.train_dir, train=True, download=True, transform=tf)
+        return DataLoader(ds, batch_size=bs, num_workers=n_workers)
     
     def val_dataloader(self):
+        num_gpus = self.hparams.num_gpus
+        num_nodes = self.hparams.num_nodes
+        dist_mode = self.hparams.dist_mode
+        grad_acc = self.hparams.grad_acc
+        bs, n_workers = self.cfg.training.bs, self.cfg.training.n_workers
+        bs = inv_effective_bs(bs, num_gpus, num_nodes, dist_mode, grad_acc)
+
         tf = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5])
         ])
-        val_ds = datasets.MNIST(root=self.data_pth, train=False, transform=tf, download=True)
-        val_dl = DataLoader(val_ds, self.batch_size, shuffle=False, num_workers=self.num_workers)
-        return val_dl
+        ds = datasets.MNIST(self.cfg.data.val_dir, train=False, download=True, transform=tf)
+        return DataLoader(ds, batch_size=bs, num_workers=n_workers)
+
+
+
+def effective_bs(bs, num_gpus, num_nodes, dist_mode, grad_acc):
+    if dist_mode == 'dp':
+        eff_bs = bs
+    elif dist_mode == 'ddp' or dist_mode == 'horovod':
+        eff_bs = bs * num_gpus * num_nodes
+    elif dist_mode == 'ddp2':
+        eff_bs = bs * num_nodes
     
-    @staticmethod
-    def add_model_specific_args(parent_parser):
-        parser = ArgumentParser(parents=[parent_parser])
-        parser.add_argument('--ic', default=1, type=int)
-        parser.add_argument('--oc', default=10, type=int)
-        parser.add_argument('--lr', default=0.01, type=float)
-        parser.add_argument('--batch_size', default=16, type=int)
-        parser.add_argument('--data_pth', default='data/', type=str)
-        parser.add_argument('--num-workers', default=10, type=int)
-        return parser
+    eff_bs *= grad_acc
+    return eff_bs
 
-# logger & callbacks
-logger = pl_loggers.TensorBoardLogger('exp_logs/')
-callback = ModelCheckpoint(
-    save_top_k=1,
-    mode='max',
-    save_last=True
-)
+def inv_effective_bs(eff_bs, num_gpus, num_nodes, dist_mode, grad_acc):
+    if dist_mode == 'dp':
+        bs = eff_bs
+    elif dist_mode == 'ddp' or dist_mode == 'horovod':
+        bs = eff_bs // num_gpus // num_nodes
+    elif dist_mode == 'ddp2':
+        bs = eff_bs // num_nodes
+    
+    bs //= grad_acc
+    return bs
 
-# parse arguments
-parser = ArgumentParser(add_help=False)
-parser = Trainer.add_argparse_args(parser)
-parser.add_argument('--seed', default=1, type=int)
-parser = Model.add_model_specific_args(parser)
-parser.set_defaults(
-    logger=logger,
-    max_epochs=20,
-    gpus=1
-)
+parser = ArgumentParser()
+parser.add_argument('-c', '--config', type=str, default='config.yaml', help='.yaml config file')
+parser.add_argument('-g', '--num-gpus', type=int, default=2, help='gpus')
+parser.add_argument('-n', '--num-nodes', type=int, default=1, help='nodes')
+parser.add_argument('-d', '--dist-mode', type=str, default='ddp', help='distributed modes')
+parser.add_argument('-a', '--grad-acc', type=int, default=1, help='accumulated gradients')
+
+parser.add_argument('-m', '--model-path-ckpt', type=str, help='model checkpoint path')
+parser.add_argument('-r', '--resume-path-ckpt', type=str, default=None, help='resume training checkpoint path')
+parser.add_argument('-e', '--experiment-name', type=str, default=None, help='experiment name')
+parser.add_argument('-t', '--top-k-save', type=int, default=5, help='save top k')
+parser.add_argument('-f', '--fast-dev-run', action='store_true', help='perform fast dev run')
+
+
 args = parser.parse_args()
-# print(args)
+model = BoilerNet(args)
+cfg = OmegaConf.load(args.config)
 
+experiment_name = args.experiment_name
+if experiment_name is None:
+    experiment_name = datetime.now().strftime("%m%d%Y-%H:%M:%S")
 
-# set seed
-if args.seed is not None:
-    seed_everything(args.seed)
+ckpt_pth = os.path.join(args.model_path_ckpt, experiment_name)
+log_dir = os.path.join(cfg.logging.log_dir, experiment_name)
 
-# scale batchsize
-if args.distributed_backend == 'ddp':
-    args.batch_size = args.batch_size // (max(args.gpus, 1) * max(args.num_nodes, 1))
-    args.num_workers = args.num_workers // (max(args.gpus, 1) * max(args.num_nodes, 1))
-elif args.distributed_backend == 'ddp2':
-    args.batch_size = args.batch_size // (max(args.gpus, 1) * max(args.num_nodes, 1))
-    args.num_workers = args.num_workers // max(args.num_nodes, 1)
+os.makedirs(ckpt_pth, exist_ok=True)
+ckpt_callback = ModelCheckpoint(
+    filepath=ckpt_pth,
+    monitor='val_loss',
+    verbose=True,
+    save_top_k=args.top_k_save
+)
 
-# initialize model and trainer
-model = Model(**vars(args))
-print(args.checkpoint_callback)
-trainer = Trainer.from_argparse_args(args, checkpoint_callback=callback)
+trainer = Trainer(
+    logger=pl_loggers.TensorBoardLogger(log_dir),
+    checkpoint_callback=ckpt_callback,
+    weights_save_path=ckpt_pth,
+    gpus=args.num_gpus,
+    accumulate_grad_batches=args.grad_acc,
+    distributed_backend='ddp',
+    resume_from_checkpoint=args.resume_path_ckpt,
+    gradient_clip_val=cfg.training.gradient_clip,
+    fast_dev_run=args.fast_dev_run,
+    max_epochs=cfg.training.epoch_num
+)
 
-# fit the model
 trainer.fit(model)
